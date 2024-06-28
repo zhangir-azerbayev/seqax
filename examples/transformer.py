@@ -65,11 +65,11 @@ with MESH:
             'b/d nh s1 hd, b/d nh s2 hd -> b/d nh s1 s2',
             Q, K
         )
-        weights = jax.nn.softmax(jnp.tril(logits))
+        attn_scores = jax.nn.softmax(jnp.tril(logits))
 
         unflattened_out = shardops.einsum_unreduced(
             'b/d nh s1 s2, b/d nh s2 hd -> b/d nh s1 hd',
-            weights, V
+            attn_scores, V
         )
 
         return einops.rearrange(unflattened_out, 'b nh s hd -> b s (nh hd)')
