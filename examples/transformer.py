@@ -22,9 +22,7 @@ MESH = Mesh(mesh_utils.create_device_mesh([8], jax.devices()), ('d'))
 
 @pytree_dataclass
 class MultiHeadAttention:
-    q: f32['num_heads d_model head_dim']
-    k: f32['num_heads d_model head_dim']
-    v: f32['num_heads d_model head_dim']
+    qkv: f32['num_heads d_model 3head_dim']
 
 @pytree_dataclass
 class MLP:
@@ -56,22 +54,17 @@ with MESH:
 
 
     def attention_forward(x: f32[b'batch/d seq d_model'], w: MultiHeadAttention) -> f32[b'batch/d seq d_model']:
-        Q = shardops.einsum_unreduced(
-            'b/d s d, nh d hd -> b/d nh s hd', 
-            x, w.q
-            )
-        K = shardops.einsum_unreduced(
-            'b/d s d, nh d hd -> b/d nh s hd', 
-            x, w.k
-            )
-        V = shardops.einsum_unreduced(
-            'b/d s d, nh d hd -> b/d nh s hd', 
-            x, w.v
-            )
+        QKV = shardops.einsum_unreduced(
+            'b/d s d, nh d 3hd -> b/d nh s 3hd', 
+            x, w.qkv
+        )
+        
+        Q, K, V = jnp.split(QKV, 3, axis=-1)
+
         logits = shardops.einsum_unreduced(
             'b/d nh s1 hd, b/d nh s2 hd -> b/d nh s1 s2',
             Q, K
-            )
+        )
         weights = jax.nn.softmax(jnp.tril(logits))
 
         unflattened_out = shardops.einsum_unreduced(
@@ -92,8 +85,6 @@ with MESH:
 
         return out
     
-    # def rms_norm_forward(x: f32[b'batch/d seq d_model'], w: RMSNorm) -> 
-
     @typed_shard_map
     def transformer_block_forward(x: f32[b'batch/d seq d_model'], w: TransformerBlock) -> f32[b'batch/d seq d_model']:
         x = x + rms_norm_forward(attention_forward(x, w.attention), w.norm1)
@@ -107,9 +98,7 @@ with MESH:
         eps=jnp.array(1e-5, dtype=jnp.float32)
     )
     w_mha = MultiHeadAttention(
-        q=jnp.zeros((num_heads, d_model, head_dim), dtype=jnp.float32),
-        k=jnp.zeros((num_heads, d_model, head_dim), dtype=jnp.float32),
-        v=jnp.zeros((num_heads, d_model, head_dim), dtype=jnp.float32),
+        qkv=jnp.zeros((num_heads, d_model, 3*head_dim), dtype=jnp.float32),
     )
     w_norm2 = copy.deepcopy(w_norm1)
     w_mlp = MLP(
