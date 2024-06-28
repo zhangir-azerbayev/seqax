@@ -9,7 +9,6 @@ import jax
 import jax.numpy as jnp
 import einops
 
-# make distributed later
 MESH = Mesh(mesh_utils.create_device_mesh([8], jax.devices()), ('d'))
 
 @pytree_dataclass
