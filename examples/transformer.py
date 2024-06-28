@@ -49,47 +49,47 @@ head_dim = 16
 num_heads = 4
 
 with MESH:
-    def rms_norm_forward(x: f32[b'batch/d seq d_model'], w: RMSNorm) -> f32[b'batch/d seq d_model']:
+    def rms_norm_forward(x: f32[b'batch seq d_model'], w: RMSNorm) -> f32[b'batch seq d_model']:
         return w.gain * x * jax.lax.rsqrt(jnp.mean(x**2, axis=-1, keepdims=True) + w.eps)
 
 
-    def attention_forward(x: f32[b'batch/d seq d_model'], w: MultiHeadAttention) -> f32[b'batch/d seq d_model']:
+    def attention_forward(x: f32[b'batch seq d_model'], w: MultiHeadAttention) -> f32[b'batch seq d_model']:
         QKV = shardops.einsum_unreduced(
-            'b/d s d, nh d 3hd -> b/d nh s 3hd', 
+            'b s d, nh d 3hd -> b nh s 3hd', 
             x, w.qkv
         )
         
         Q, K, V = jnp.split(QKV, 3, axis=-1)
 
         logits = shardops.einsum_unreduced(
-            'b/d nh s1 hd, b/d nh s2 hd -> b/d nh s1 s2',
+            'b nh s1 hd, b nh s2 hd -> b nh s1 s2',
             Q, K
         )
         attn_scores = jax.nn.softmax(jnp.tril(logits))
 
         unflattened_out = shardops.einsum_unreduced(
-            'b/d nh s1 s2, b/d nh s2 hd -> b/d nh s1 hd',
+            'b nh s1 s2, b nh s2 hd -> b nh s1 hd',
             attn_scores, V
         )
 
         return einops.rearrange(unflattened_out, 'b nh s hd -> b s (nh hd)')
 
-    def mlp_forward(x: f32[b'batch/d seq d_model'], w: MLP) -> f32[b'batchd/ seq d_model']:
+    def mlp_forward(x: f32[b'batch seq d_model'], w: MLP) -> f32[b'batchd/ seq d_model']:
         hidden_preact = shardops.einsum_unreduced(
-            'b/d s d, d h -> b/d s h',
+            'b s d, d h -> b s h',
             x, w.up
         )
         hidden = jax.nn.relu(hidden_preact)
 
-        out = shardops.einsum_unreduced('b/d s h, h d -> b/d s d', hidden, w.down)
+        out = shardops.einsum_unreduced('b s h, h d -> b s d', hidden, w.down)
 
         return out
     
     @jax.jit
     @typed_shard_map
     def transformer_block_forward(x: f32[b'batch/d seq d_model'], w: TransformerBlock) -> f32[b'batch/d seq d_model']:
-        x = x + rms_norm_forward(attention_forward(x, w.attention), w.norm1)
-        x = x + rms_norm_forward(mlp_forward(x, w.mlp), w.norm2)
+        x = x + attention_forward(rms_norm_forward(x, w.norm1), w.attention)
+        x = x + mlp_forward(rms_norm_forward(x, w.norm2), w.mlp)
 
         return x
 
