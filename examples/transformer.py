@@ -22,12 +22,12 @@ MESH = Mesh(mesh_utils.create_device_mesh([8], jax.devices()), ('d'))
 
 @pytree_dataclass
 class MultiHeadAttention:
-    qkv: f32['num_heads d_model 3head_dim']
+    qkv: f32['num_heads d_model 3head_dim/d']
 
 @pytree_dataclass
 class MLP:
-    up: f32['d_model hidden']
-    down: f32['hidden d_model']
+    up: f32['d_model hidden/d']
+    down: f32['hidden d_model/d']
 
 @pytree_dataclass 
 class RMSNorm:
@@ -54,9 +54,11 @@ with MESH:
 
 
     def attention_forward(x: f32[b'batch seq d_model'], w: MultiHeadAttention) -> f32[b'batch seq d_model']:
+        w_qkv = shardops.all_gather('nh d 3hd/d -> nh d 3hd', w.qkv)
+
         QKV = shardops.einsum_unreduced(
             'b s d, nh d 3hd -> b nh s 3hd', 
-            x, w.qkv
+            x, w_qkv
         )
         
         Q, K, V = jnp.split(QKV, 3, axis=-1)
@@ -74,14 +76,16 @@ with MESH:
 
         return einops.rearrange(unflattened_out, 'b nh s hd -> b s (nh hd)')
 
-    def mlp_forward(x: f32[b'batch seq d_model'], w: MLP) -> f32[b'batchd/ seq d_model']:
+    def mlp_forward(x: f32[b'batch seq d_model'], w: MLP) -> f32[b'batch seq d_model']:
+        w_up = shardops.all_gather('d h/d -> d h', w.up)
         hidden_preact = shardops.einsum_unreduced(
             'b s d, d h -> b s h',
-            x, w.up
+            x, w_up
         )
         hidden = jax.nn.relu(hidden_preact)
 
-        out = shardops.einsum_unreduced('b s h, h d -> b s d', hidden, w.down)
+        w_down = shardops.all_gather('h d/d -> h d', w.down)
+        out = shardops.einsum_unreduced('b s h, h d -> b s d', hidden, w_down)
 
         return out
     
