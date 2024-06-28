@@ -8,6 +8,15 @@ from jax.experimental import mesh_utils
 import jax
 import jax.numpy as jnp
 import einops
+import copy
+
+# Inside function bodies, the following abbrvs. for named dims are used
+# b: batch
+# s: seq
+# d: d_model 
+# h: hidden 
+# nh: num_heads
+# hd: head_dim
 
 MESH = Mesh(mesh_utils.create_device_mesh([8], jax.devices()), ('d'))
 
@@ -48,25 +57,25 @@ with MESH:
 
     def attention_forward(x: f32[b'batch/d seq d_model'], w: MultiHeadAttention) -> f32[b'batch/d seq d_model']:
         Q = shardops.einsum_unreduced(
-            'batch/d seq d_model, num_heads d_model head_dim -> batch/d num_heads seq head_dim', 
+            'b/d s d, nh d hd -> b/d nh s hd', 
             x, w.q
             )
         K = shardops.einsum_unreduced(
-            'batch/d seq d_model, num_heads d_model head_dim -> batch/d num_heads seq head_dim', 
+            'b/d s d, nh d hd -> b/d nh s hd', 
             x, w.k
             )
         V = shardops.einsum_unreduced(
-            'batch/d seq d_model, num_heads d_model head_dim -> batch/d num_heads seq head_dim', 
+            'b/d s d, nh d hd -> b/d nh s hd', 
             x, w.v
             )
         logits = shardops.einsum_unreduced(
-            'batch/d num_heads seq1 head_dim, batch/d num_heads seq2 head_dim -> batch/d num_heads seq1 seq2',
+            'b/d nh s1 hd, b/d nh s2 hd -> b/d nh s1 s2',
             Q, K
             )
         weights = jax.nn.softmax(jnp.tril(logits))
 
         unflattened_out = shardops.einsum_unreduced(
-            'batch/d num_heads seq1 seq2, batch/d num_heads seq2 head_dim -> batch/d num_heads seq1 head_dim',
+            'b/d nh s1 s2, b/d nh s2 hd -> b/d nh s1 hd',
             weights, V
         )
 
@@ -74,12 +83,12 @@ with MESH:
 
     def mlp_forward(x: f32[b'batch/d seq d_model'], w: MLP) -> f32[b'batchd/ seq d_model']:
         hidden_preact = shardops.einsum_unreduced(
-            'batch/d seq d_model, d_model hidden -> batch/d seq hidden',
+            'b/d s d, d h -> b/d s h',
             x, w.up
         )
         hidden = jax.nn.relu(hidden_preact)
 
-        out = shardops.einsum_unreduced('batch/d seq hidden, hidden d_model -> batch/d seq d_model', hidden, w.down)
+        out = shardops.einsum_unreduced('b/d s h, h d -> b/d s d', hidden, w.down)
 
         return out
     
@@ -93,17 +102,20 @@ with MESH:
         return x
 
     # init dummy weights
-    w_norm1 = RMSNorm(gain=jnp.array(1, dtype=jnp.float32), eps=jnp.array(1e-5, dtype=jnp.float32))
+    w_norm1 = RMSNorm(
+        gain=jnp.array(1, dtype=jnp.float32), 
+        eps=jnp.array(1e-5, dtype=jnp.float32)
+    )
     w_mha = MultiHeadAttention(
         q=jnp.zeros((num_heads, d_model, head_dim), dtype=jnp.float32),
         k=jnp.zeros((num_heads, d_model, head_dim), dtype=jnp.float32),
         v=jnp.zeros((num_heads, d_model, head_dim), dtype=jnp.float32),
     )
-    w_norm2 = RMSNorm(gain=jnp.array(1, dtype=jnp.float32), eps=jnp.array(1e-5, dtype=jnp.float32))
+    w_norm2 = copy.deepcopy(w_norm1)
     w_mlp = MLP(
         up=jnp.zeros((d_model, hidden), dtype=jnp.float32), 
         down=jnp.zeros((hidden, d_model), dtype=jnp.float32)
-        )
+    )
     w = TransformerBlock(
         norm1=w_norm1,
         attention=w_mha,
