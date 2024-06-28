@@ -85,6 +85,7 @@ with MESH:
 
         return out
     
+    @jax.jit
     @typed_shard_map
     def transformer_block_forward(x: f32[b'batch/d seq d_model'], w: TransformerBlock) -> f32[b'batch/d seq d_model']:
         x = x + rms_norm_forward(attention_forward(x, w.attention), w.norm1)
