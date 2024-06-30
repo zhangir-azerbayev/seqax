@@ -57,7 +57,6 @@ with MESH:
     def attention_forward(
             x: f32[b'batch/d seq d_model'], w: MultiHeadAttention
         ) -> f32[b'batch/d seq d_model/t']:
-        print("inside attention", x)
         w_qkv = shardops.all_gather(
             'num_heads/t d_model 3head_dim/d -> num_heads/t d_model 3head_dim', 
             w.qkv
@@ -104,10 +103,13 @@ with MESH:
             w: TransformerBlock
         ) -> f32[b'batch seq d_model']:
 
-        x = x + attention_forward(rms_norm_forward(x, w.norm1), w.attention)
-        x = x + mlp_forward(rms_norm_forward(x, w.norm2), w.mlp)
+        print("pre attention_forward: ", x.sharding)
+        x_post_attn = x + attention_forward(rms_norm_forward(x, w.norm1), w.attention)
+        print("pre mlp_forward: ", x_post_attn.sharding)
+        x_post_mlp = x_post_attn + mlp_forward(rms_norm_forward(x_post_attn, w.norm2), w.mlp)
+        print("returning transformer_block:", x_post_mlp.sharding)
 
-        return x
+        return x_post_mlp
 
 
     # init dummy weights and do forward pass
