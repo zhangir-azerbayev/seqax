@@ -1,5 +1,8 @@
-# XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m examples/shardlib_transformer
-from shardlib.shardtypes import bf16, bool_, f32, pytree_dataclass, typed_shard_map, u32, make_shardings
+# XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m examples.transformer
+import copy
+from dataclasses import dataclass, field
+
+from shardlib.shardtypes import f32, pytree_dataclass, typed_shard_map
 from shardlib import shardtypes
 shardtypes.register_with_typeguard()
 import shardlib.shardops as shardops
@@ -8,26 +11,18 @@ from jax.experimental import mesh_utils
 import jax
 import jax.numpy as jnp
 import einops
-import copy
 
-# Inside function bodies, the following abbrvs. for named dims are used
-# b: batch
-# s: seq
-# d: d_model 
-# h: hidden 
-# nh: num_heads
-# hd: head_dim
-
-MESH = Mesh(mesh_utils.create_device_mesh([8], jax.devices()), ('d'))
+# `d` is data parallel axis, `t` is tensor parallel axis
+MESH = Mesh(mesh_utils.create_device_mesh([4, 2], jax.devices()), ('d', 't'))
 
 @pytree_dataclass
 class MultiHeadAttention:
-    qkv: f32['num_heads d_model 3head_dim/d']
+    qkv: f32['num_heads/t d_model 3head_dim/d']
 
 @pytree_dataclass
 class MLP:
-    up: f32['d_model hidden/d']
-    down: f32['hidden d_model/d']
+    up: f32['d_model hidden/t/d']
+    down: f32['hidden d_model/t/d']
 
 @pytree_dataclass 
 class RMSNorm:
@@ -41,74 +36,93 @@ class TransformerBlock:
     norm2: RMSNorm
     mlp: MLP
 
-batch = 8
-seq = 12
-d_model = 64
-hidden = 4*d_model
-head_dim = 16
-num_heads = 4
+@dataclass
+class ModelArgs:
+    batch: int = 8
+    seq: int = 12
+    d_model: int = 64
+    num_heads: int = 4
+    hidden: int = field(init=False)
+    head_dim: int = field(init=False)
+
+    def __post_init__(self):
+        self.hidden = 4*self.d_model
+        self.head_dim = self.d_model // self.num_heads
 
 with MESH:
     def rms_norm_forward(x: f32[b'batch seq d_model'], w: RMSNorm) -> f32[b'batch seq d_model']:
-        return w.gain * x * jax.lax.rsqrt(jnp.mean(x**2, axis=-1, keepdims=True) + w.eps)
+        return w.gain * x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + w.eps)
 
-
-    def attention_forward(x: f32[b'batch seq d_model'], w: MultiHeadAttention) -> f32[b'batch seq d_model']:
-        w_qkv = shardops.all_gather('nh d 3hd/d -> nh d 3hd', w.qkv)
-
+    @typed_shard_map
+    def attention_forward(
+            x: f32[b'batch/d seq d_model'], w: MultiHeadAttention
+        ) -> f32[b'batch/d seq d_model/t']:
+        print("inside attention", x)
+        w_qkv = shardops.all_gather(
+            'num_heads/t d_model 3head_dim/d -> num_heads/t d_model 3head_dim', 
+            w.qkv
+        )
         QKV = shardops.einsum_unreduced(
-            'b s d, nh d 3hd -> b nh s 3hd', 
+            'batch/d seq d_model, num_heads/t d_model 3head_dim -> batch/d num_heads/t seq 3head_dim', 
             x, w_qkv
         )
-        
         Q, K, V = jnp.split(QKV, 3, axis=-1)
 
         logits = shardops.einsum_unreduced(
-            'b nh s1 hd, b nh s2 hd -> b nh s1 s2',
+            'batch/d num_heads/t seq1 head_dim, batch/d num_heads/t seq2 head_dim -> batch/d num_heads/t seq1 seq2',
             Q, K
         )
         attn_scores = jax.nn.softmax(jnp.tril(logits))
 
         unflattened_out = shardops.einsum_unreduced(
-            'b nh s1 s2, b nh s2 hd -> b nh s1 hd',
+            'batch/d num_heads/t seq1 seq2, batch/d num_heads/t seq2 head_dim -> batch/d num_heads/t seq1 head_dim',
             attn_scores, V
         )
 
         return einops.rearrange(unflattened_out, 'b nh s hd -> b s (nh hd)')
 
-    def mlp_forward(x: f32[b'batch seq d_model'], w: MLP) -> f32[b'batch seq d_model']:
-        w_up = shardops.all_gather('d h/d -> d h', w.up)
+    @typed_shard_map
+    def mlp_forward(x: f32[b'batch/d seq d_model'], w: MLP) -> f32[b'batch/d seq d_model/t']:
+        w_up = shardops.all_gather('d_model hidden/t/d -> d_model hidden/t', w.up)
         hidden_preact = shardops.einsum_unreduced(
-            'b s d, d h -> b s h',
+            'batch/d seq d_model, d_model hidden/t -> batch/d seq hidden/t',
             x, w_up
         )
-        hidden = jax.nn.relu(hidden_preact)
+        hidden_act = jax.nn.relu(hidden_preact)
 
-        w_down = shardops.all_gather('h d/d -> h d', w.down)
-        out = shardops.einsum_unreduced('b s h, h d -> b s d', hidden, w_down)
+        hidden_act = shardops.all_gather('batch/d seq hidden/t -> batch/d seq hidden', hidden_act)
+        w_down = shardops.all_gather('hidden d_model/t/d -> hidden d_model/t', w.down)
+        out = shardops.einsum_unreduced(
+            'batch/d seq hidden, hidden d_model/t -> batch/d seq d_model/t', 
+            hidden_act, w_down
+        )
 
         return out
     
-    @jax.jit
-    @typed_shard_map
-    def transformer_block_forward(x: f32[b'batch/d seq d_model'], w: TransformerBlock) -> f32[b'batch/d seq d_model']:
+    def transformer_block_forward(
+            x: f32[b'batch seq d_model'], 
+            w: TransformerBlock
+        ) -> f32[b'batch seq d_model']:
+
         x = x + attention_forward(rms_norm_forward(x, w.norm1), w.attention)
         x = x + mlp_forward(rms_norm_forward(x, w.norm2), w.mlp)
 
         return x
 
-    # init dummy weights
+
+    # init dummy weights and do forward pass
+    cfg = ModelArgs()
     w_norm1 = RMSNorm(
         gain=jnp.array(1, dtype=jnp.float32), 
         eps=jnp.array(1e-5, dtype=jnp.float32)
     )
     w_mha = MultiHeadAttention(
-        qkv=jnp.zeros((num_heads, d_model, 3*head_dim), dtype=jnp.float32),
+        qkv=jnp.zeros((cfg.num_heads, cfg.d_model, 3*cfg.head_dim), dtype=jnp.float32),
     )
     w_norm2 = copy.deepcopy(w_norm1)
     w_mlp = MLP(
-        up=jnp.zeros((d_model, hidden), dtype=jnp.float32), 
-        down=jnp.zeros((hidden, d_model), dtype=jnp.float32)
+        up=jnp.zeros((cfg.d_model, cfg.hidden), dtype=jnp.float32), 
+        down=jnp.zeros((cfg.hidden, cfg.d_model), dtype=jnp.float32)
     )
     w = TransformerBlock(
         norm1=w_norm1,
@@ -117,7 +131,7 @@ with MESH:
         mlp=w_mlp,
     )
 
-    x1 = transformer_block_forward(jnp.zeros((batch, seq, d_model), dtype=jnp.float32), w)
+    y = transformer_block_forward(jnp.zeros((cfg.batch, cfg.seq, cfg.d_model), dtype=jnp.float32), w)
 
-    assert (x1.shape==(batch, seq, d_model))
+    assert (y.shape==(cfg.batch, cfg.seq, cfg.d_model))
     print("great success!")
