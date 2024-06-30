@@ -50,6 +50,7 @@ class ModelArgs:
         self.head_dim = self.d_model // self.num_heads
 
 with MESH:
+    @jax.jit
     def rms_norm_forward(x: f32[b'batch seq d_model'], w: RMSNorm) -> f32[b'batch seq d_model']:
         return w.gain * x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + w.eps)
 
@@ -98,6 +99,7 @@ with MESH:
 
         return out
     
+    # we could jit this function, but then the print statements would be less helpful
     def transformer_block_forward(
             x: f32[b'batch seq d_model'], 
             w: TransformerBlock
