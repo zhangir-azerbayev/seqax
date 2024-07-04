@@ -1,9 +1,7 @@
 # XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m examples.transformer
-from collections.abc import Callable
-import copy
 from dataclasses import dataclass, field
 
-from shardlib.shardtypes import f32, i32, make_shardings, pytree_dataclass, typed_shard_map
+from shardlib.shardtypes import f32, make_shardings, pytree_dataclass, typed_shard_map
 from shardlib import shardtypes
 shardtypes.register_with_typeguard()
 import shardlib.shardops as shardops
@@ -55,8 +53,6 @@ with MESH:
         perm = [(i, (i+1)%num_stages) for i in range(num_stages)]
         stage_output = jax.lax.ppermute(stage_output, 'p', perm=perm)
 
-        print(stage_output)
-
         return stage_output
 
     def execute_pipeline(
@@ -64,15 +60,15 @@ with MESH:
             weights: PipelinedLinearLayers
     ) -> f32[b'num_layers/p batch d_model']:
         num_stages = pipeline_input.shape[0]
-        print(pipeline_input)
+        print("pipeline input :", pipeline_input, pipeline_input.sharding)
         
         scan_fn = lambda carry, _: (pipeline_step_with_permute(carry, weights), None)
         
-        pipeline_output, _ = jax.lax.scan(scan_fn, pipeline_input, None, length=num_stages-1)
+        carry, _ = jax.lax.scan(scan_fn, pipeline_input, None, length=num_stages-1)
 
-        pipeline_output = pipeline_step(pipeline_output, weights)
+        pipeline_output = pipeline_step(carry, weights)
 
-        print(pipeline_output)
+        print("pipeline output: ", pipeline_output, pipeline_output.sharding)
 
         return pipeline_output
 
@@ -90,5 +86,8 @@ with MESH:
     pipeline_input = jnp.stack(
         [input, *[jnp.zeros_like(input) for _ in range(3)]]
     )
+    pipeline_input = jax.device_put(pipeline_input, make_shardings(f32['num_layers/p batch d_model']))
+
+    print(make_shardings)
 
     output = execute_pipeline(pipeline_input, weights)
