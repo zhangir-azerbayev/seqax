@@ -3,7 +3,7 @@ from collections.abc import Callable
 import copy
 from dataclasses import dataclass, field
 
-from shardlib.shardtypes import f32, make_shardings, pytree_dataclass, typed_shard_map
+from shardlib.shardtypes import f32, i32, make_shardings, pytree_dataclass, typed_shard_map
 from shardlib import shardtypes
 shardtypes.register_with_typeguard()
 import shardlib.shardops as shardops
@@ -13,8 +13,8 @@ import jax
 import jax.numpy as jnp
 import einops
 from jax.experimental.shard_map import shard_map
-from typing import Tuple
 import functools as ft
+from typing import Tuple
 
 # 'p' is pipeline parallel axis
 MESH = Mesh(mesh_utils.create_device_mesh([4], jax.devices()), ('p'))
@@ -30,12 +30,10 @@ class PipelinedLinearLayers:
     layers: f32['num_layers/p d_model d_model']
 
 with MESH:
-    @typed_shard_map
     def pipeline_step(
         carries: f32[b'num_layers/p batch d_model'],
         weights: PipelinedLinearLayers,
-        ) -> f32[b'num_layers/p batch d_model']:
-        num_stages = jax.lax.psum(1, 'p')
+    ) -> f32[b'num_layers/p batch d_model']:
 
         stage_preact = shardops.einsum_unreduced(
             'num_layers/p batch d_model1, num_layers/p d_model1 d_model2 -> num_layers/p batch d_model2',
@@ -44,24 +42,53 @@ with MESH:
 
         stage_output = jax.nn.relu(stage_preact)
 
-        new_carries = jax.lax.ppermute(
-            stage_output,
-            'p',
-            perm=[(i, (i+1)%num_stages) for i in range(num_stages)]
-        )
+        return stage_output
 
-        return new_carries
+    @typed_shard_map
+    def pipeline_step_with_permute(
+        carries: f32[b'num_layers/p batch d_model'],
+        weights: PipelinedLinearLayers,
+    ) -> f32[b'num_layers/p batch d_model']:
+        stage_output = pipeline_step(carries, weights)
+
+        num_stages = jax.lax.psum(1, 'p')
+        perm = [(i, (i+1)%num_stages) for i in range(num_stages)]
+        stage_output = jax.lax.ppermute(stage_output, 'p', perm=perm)
+
+        print(stage_output)
+
+        return stage_output
+
+    def execute_pipeline(
+            pipeline_input: f32[b'num_layers/p batch d_model'],
+            weights: PipelinedLinearLayers
+    ) -> f32[b'num_layers/p batch d_model']:
+        num_stages = pipeline_input.shape[0]
+        print(pipeline_input)
+        
+        scan_fn = lambda carry, _: (pipeline_step_with_permute(carry, weights), None)
+        
+        pipeline_output, _ = jax.lax.scan(scan_fn, pipeline_input, None, length=num_stages-1)
+
+        pipeline_output = pipeline_step(pipeline_output, weights)
+
+        print(pipeline_output)
+
+        return pipeline_output
+
 
     cfg = ModelArgs()
     key = jax.random.key(42)
 
     key, sbkey = jax.random.split(key)
-    layers = PipelinedLinearLayers(
-        layers=jax.random.normal(sbkey, (cfg.num_layers, cfg.d_model, cfg.d_model))
+    weights = PipelinedLinearLayers(
+        layers=jnp.stack([jnp.identity(cfg.d_model) for _ in range(cfg.num_layers)])
     )
-    layers = jax.tree.map(jax.device_put, layers, make_shardings(PipelinedLinearLayers))
+    weights = jax.tree.map(jax.device_put, weights, make_shardings(PipelinedLinearLayers))
 
-    key, sbkey = jax.random.split(key)
-    carry = jax.random.normal(sbkey, (cfg.num_layers, cfg.batch, cfg.d_model))
+    input = jax.random.normal(sbkey, (cfg.batch, cfg.d_model))
+    pipeline_input = jnp.stack(
+        [input, *[jnp.zeros_like(input) for _ in range(3)]]
+    )
 
-    stage_output = pipeline_step(carry, layers)
+    output = execute_pipeline(pipeline_input, weights)
