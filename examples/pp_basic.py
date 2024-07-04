@@ -36,7 +36,6 @@ with MESH:
         weights: PipelinedLinearLayers,
         ) -> f32[b'num_layers/p batch d_model']:
         num_stages = jax.lax.psum(1, 'p')
-        stage_index = jax.lax.axis_index('p')
 
         stage_preact = shardops.einsum_unreduced(
             'num_layers/p batch d_model1, num_layers/p d_model1 d_model2 -> num_layers/p batch d_model2',
