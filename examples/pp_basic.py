@@ -21,31 +21,56 @@ MESH = Mesh(mesh_utils.create_device_mesh([4], jax.devices()), ('p'))
 class ModelArgs:
     batch: int = 2
     num_layers: int = 4 # check this works with size of 'p' axis
-    d_model: int = 16
+    d_model: int = 8
+    hidden: int = field(init=False)
+
+    def __post_init__(self):
+        self.hidden = 2*self.d_model
 
 @pytree_dataclass
-class PipelinedLinearLayers:
-    layers: f32['num_layers/p d_model d_model']
+class MLP:
+    up: f32['d_model hidden']
+    down: f32['hidden d_model']
+
+@pytree_dataclass
+class MLPBlocks:
+    up: f32['num_layers/p d_model hidden']
+    down: f32['num_layers/p hidden d_model']
 
 with MESH:
-    def pipeline_step(
-        carries: f32[b'num_layers/p batch d_model'],
-        weights: PipelinedLinearLayers,
-    ) -> f32[b'num_layers/p batch d_model']:
-
-        stage_preact = shardops.einsum_unreduced(
-            'num_layers/p batch d_model1, num_layers/p d_model1 d_model2 -> num_layers/p batch d_model2',
-            carries, weights.layers
+    def ffn_block(
+        input: f32[b'batch d_model'],
+        w: MLP
+    ) -> f32['batch d_model']:
+        hidden_preact = shardops.einsum_unreduced(
+            'batch d_model, d_model hidden -> batch hidden', 
+            input, w.up
         )
 
-        stage_output = jax.nn.relu(stage_preact)
+        hidden_act = jax.nn.relu(hidden_preact)
+
+        out = shardops.einsum_unreduced(
+            'batch hidden, hidden d_model -> batch d_model',
+            hidden_act, w.down
+        )
+
+        return out
+
+    def pipeline_step(
+        carries: f32[b'num_layers/p batch d_model'],
+        weights: MLPBlocks,
+    ) -> f32[b'num_layers/p batch d_model']:
+
+        pipeline_step_fn = jax.vmap(ffn_block, (0, 0), 0)
+
+        stage_output = pipeline_step_fn(carries, weights)
 
         return stage_output
 
     @typed_shard_map
     def pipeline_step_with_permute(
         carries: f32[b'num_layers/p batch d_model'],
-        weights: PipelinedLinearLayers,
+        weights: MLPBlocks,
     ) -> f32[b'num_layers/p batch d_model']:
         stage_output = pipeline_step(carries, weights)
 
@@ -57,7 +82,7 @@ with MESH:
 
     def execute_pipeline(
             pipeline_input: f32[b'num_layers/p batch d_model'],
-            weights: PipelinedLinearLayers
+            weights: MLPBlocks
     ) -> f32[b'num_layers/p batch d_model']:
         num_stages = pipeline_input.shape[0]
         print("pipeline input :", pipeline_input, pipeline_input.sharding)
@@ -74,20 +99,18 @@ with MESH:
 
 
     cfg = ModelArgs()
+    num_stages = len(jax.devices())
     key = jax.random.key(42)
 
-    key, sbkey = jax.random.split(key)
-    weights = PipelinedLinearLayers(
-        layers=jnp.stack([jnp.identity(cfg.d_model) for _ in range(cfg.num_layers)])
+    input = jax.random.normal(key, (cfg.batch, cfg.d_model))
+    init_carry = jnp.stack([input, *[jnp.zeros_like(input) for _ in range(num_stages-1)]])
+    init_carry = jax.device_put(init_carry, make_shardings(f32['num_layers/p batch d_model']))
+
+    weights = MLPBlocks(
+        up=jnp.stack([jnp.eye(cfg.d_model, cfg.hidden) for _ in range(num_stages)]),
+        down=jnp.stack([jnp.eye(cfg.hidden, cfg.d_model) for _ in range(num_stages)]),
     )
-    weights = jax.tree.map(jax.device_put, weights, make_shardings(PipelinedLinearLayers))
+    weights = jax.tree.map(jax.device_put, weights, make_shardings(MLPBlocks)) 
 
-    input = jax.random.normal(sbkey, (cfg.batch, cfg.d_model))
-    pipeline_input = jnp.stack(
-        [input, *[jnp.zeros_like(input) for _ in range(3)]]
-    )
-    pipeline_input = jax.device_put(pipeline_input, make_shardings(f32['num_layers/p batch d_model']))
 
-    print(make_shardings)
-
-    output = execute_pipeline(pipeline_input, weights)
+    output = execute_pipeline(init_carry, weights)
