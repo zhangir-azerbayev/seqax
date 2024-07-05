@@ -24,26 +24,25 @@ class MLPBlocks:
 
 
 def ffn_block(
-        input: f32[b'batch d_model'],
-        up: f32[b'd_model hidden'],
-        down: f32[b'hidden d_model']
-    ) -> f32['batch d_model']:
+    input: f32[b'batch d_model'],
+    w: MLP
+) -> f32['batch d_model']:
     hidden_preact = shardops.einsum_unreduced(
         'batch d_model, d_model hidden -> batch hidden', 
-        input, up
+        input, w.up
     )
 
     hidden_act = jax.nn.relu(hidden_preact)
 
     out = shardops.einsum_unreduced(
         'batch hidden, hidden d_model -> batch d_model',
-        hidden_act, down
+        hidden_act, w.down
     )
 
     return out
 
 with MESH:
-    num_stages = 4
+    num_stages = len(jax.devices())
 
     key = jax.random.key(42)
     input = jax.random.normal(key, (2, 8))
@@ -56,9 +55,9 @@ with MESH:
     )
     blocks = jax.tree.map(jax.device_put, blocks, make_shardings(MLPBlocks)) 
 
-    pipeline_step = jax.vmap(ffn_block, (0, 0, 0), 0)
+    pipeline_step = jax.vmap(ffn_block, (0, 0), 0)
 
-    carry = pipeline_step(init_carry, blocks.up, blocks.down)
+    carry = pipeline_step(init_carry, blocks)
 
     print(init_carry, init_carry.sharding)
     print(blocks.up, blocks.up.sharding)
