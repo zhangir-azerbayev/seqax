@@ -1,4 +1,4 @@
-# XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m examples.transformer
+# XLA_FLAGS=--xla_force_host_platform_device_count=4 python -m examples.pp_basic
 from dataclasses import dataclass, field
 
 from shardlib.shardtypes import f32, make_shardings, pytree_dataclass, typed_shard_map
@@ -16,6 +16,8 @@ from typing import Tuple
 
 # 'p' is pipeline parallel axis
 MESH = Mesh(mesh_utils.create_device_mesh([4], jax.devices()), ('p'))
+
+# next: add microbatches
 
 @dataclass 
 class ModelArgs:
@@ -56,46 +58,37 @@ with MESH:
 
         return out
 
+    @typed_shard_map
     def pipeline_step(
         carries: f32[b'num_layers/p batch d_model'],
         weights: MLPBlocks,
-    ) -> f32[b'num_layers/p batch d_model']:
-
-        pipeline_step_fn = jax.vmap(ffn_block, (0, 0), 0)
-
-        stage_output = pipeline_step_fn(carries, weights)
-
-        return stage_output
-
-    @typed_shard_map
-    def pipeline_step_with_permute(
-        carries: f32[b'num_layers/p batch d_model'],
-        weights: MLPBlocks,
-    ) -> f32[b'num_layers/p batch d_model']:
-        stage_output = pipeline_step(carries, weights)
-
+    ) -> Tuple[f32[b'num_layers/p batch d_model'], f32[b'num_layers/p batch d_model']]:
         num_stages = jax.lax.psum(1, 'p')
+
+        pp_block = jax.vmap(ffn_block, (0, 0), 0)
+
+        outputs = pp_block(carries, weights)
+
         perm = [(i, (i+1)%num_stages) for i in range(num_stages)]
-        stage_output = jax.lax.ppermute(stage_output, 'p', perm=perm)
+        new_carries = jax.lax.ppermute(outputs, 'p', perm=perm)
 
-        return stage_output
+        return new_carries, outputs
 
+    @jax.jit
     def execute_pipeline(
             pipeline_input: f32[b'num_layers/p batch d_model'],
             weights: MLPBlocks
-    ) -> f32[b'num_layers/p batch d_model']:
+    ) -> f32['num_layers/p batch d_model']: 
         num_stages = pipeline_input.shape[0]
-        print("pipeline input :", pipeline_input, pipeline_input.sharding)
         
-        scan_fn = lambda carry, _: (pipeline_step_with_permute(carry, weights), None)
+        scan_fn = lambda carries, _: pipeline_step(carries, weights)
         
-        carry, _ = jax.lax.scan(scan_fn, pipeline_input, None, length=num_stages-1)
+        _, outputs = jax.lax.scan(scan_fn, pipeline_input, None, length=num_stages)
+        # print("carry after pipeline:\n", _, _.sharding)
 
-        pipeline_output = pipeline_step(carry, weights)
+        last_stage_outputs = outputs[-1]
 
-        print("pipeline output: ", pipeline_output, pipeline_output.sharding)
-
-        return pipeline_output
+        return last_stage_outputs
 
 
     cfg = ModelArgs()
@@ -113,4 +106,6 @@ with MESH:
     weights = jax.tree.map(jax.device_put, weights, make_shardings(MLPBlocks)) 
 
 
+    print("pipeline input:\n", init_carry, init_carry.sharding)
     output = execute_pipeline(init_carry, weights)
+    print("pipeline output:\n", output, output.sharding)
