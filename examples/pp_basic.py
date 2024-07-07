@@ -22,6 +22,7 @@ MESH = Mesh(mesh_utils.create_device_mesh([4], jax.devices()), ('p'))
 @dataclass 
 class ModelArgs:
     batch: int = 2
+    num_microbatches: int = 4
     num_layers: int = 4 # check this works with size of 'p' axis
     d_model: int = 8
     hidden: int = field(init=False)
@@ -74,19 +75,20 @@ with MESH:
 
         return new_carries, outputs
 
-    @jax.jit
+    # @jax.jit
     def execute_pipeline(
-            pipeline_input: f32[b'num_layers/p batch d_model'],
-            weights: MLPBlocks
+        pipeline_input: f32[b'num_layers/p batch d_model'],
+        weights: MLPBlocks,
+        num_microbatches: int,
     ) -> f32['num_layers/p batch d_model']: 
         num_stages = pipeline_input.shape[0]
         
         scan_fn = lambda carries, _: pipeline_step(carries, weights)
         
-        _, outputs = jax.lax.scan(scan_fn, pipeline_input, None, length=num_stages)
+        _, outputs = jax.lax.scan(scan_fn, pipeline_input, None, length=num_stages+num_microbatches-1)
         # print("carry after pipeline:\n", _, _.sharding)
 
-        last_stage_outputs = outputs[-1]
+        last_stage_outputs = outputs[-num_microbatches:]
 
         return last_stage_outputs
 
@@ -95,8 +97,15 @@ with MESH:
     num_stages = len(jax.devices())
     key = jax.random.key(42)
 
-    input = jax.random.normal(key, (cfg.batch, cfg.d_model))
-    init_carry = jnp.stack([input, *[jnp.zeros_like(input) for _ in range(num_stages-1)]])
+    input = jax.random.normal(key, (cfg.num_microbatches, cfg.batch, cfg.d_model))
+    init_carry = jnp.roll(jnp.concatenate(
+        (
+            jnp.zeros((int(num_stages)-cfg.num_microbatches, cfg.batch, cfg.d_model)), 
+            jnp.flip(input, axis=0), 
+        ),
+        axis=0
+    ), 1, axis=0)
+
     init_carry = jax.device_put(init_carry, make_shardings(f32['num_layers/p batch d_model']))
 
     weights = MLPBlocks(
@@ -106,6 +115,9 @@ with MESH:
     weights = jax.tree.map(jax.device_put, weights, make_shardings(MLPBlocks)) 
 
 
-    print("pipeline input:\n", init_carry, init_carry.sharding)
-    output = execute_pipeline(init_carry, weights)
+    print("pipeline input:\n", input, input.sharding)
+    print("init carry:\n", init_carry, init_carry.sharding)
+    output = execute_pipeline(init_carry, weights, num_microbatches=cfg.num_microbatches)
+    output = output[:, -1]
     print("pipeline output:\n", output, output.sharding)
+    print("note, batches got reordered, can be easily fixed")
