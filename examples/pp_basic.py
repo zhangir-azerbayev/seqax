@@ -1,7 +1,7 @@
 # XLA_FLAGS=--xla_force_host_platform_device_count=4 python -m examples.pp_basic
 from dataclasses import dataclass, field
 
-from shardlib.shardtypes import f32, make_shardings, pytree_dataclass, typed_shard_map
+from shardlib.shardtypes import f32, make_shardings, pytree_dataclass, typed_shard_map, typechecked
 from shardlib import shardtypes
 shardtypes.register_with_typeguard()
 import shardlib.shardops as shardops
@@ -41,10 +41,12 @@ class MLPBlocks:
     down: f32['num_layers/p hidden d_model']
 
 with MESH:
+    # how to get the vmap to play nicely with typechecking?
+    # @typechecked
     def ffn_block(
         input: f32[b'batch d_model'],
         w: MLP
-    ) -> f32['batch d_model']:
+    ) -> f32[b'batch d_model']:
         hidden_preact = shardops.einsum_unreduced(
             'batch d_model, d_model hidden -> batch hidden', 
             input, w.up
@@ -85,11 +87,12 @@ with MESH:
         return new_carries, outputs
 
     @jax.jit
+    @typechecked
     def execute_pipeline(
-        init_carries: f32['num_layers/p batch d_model'],
+        init_carries: f32[b'num_layers/p batch d_model'],
         inputs: f32[b'num_microbatches batch d_model'],
         weights: MLPBlocks,
-    ) -> f32['num_microbatches batch d_model']: 
+    ) -> f32[b'num_microbatches batch d_model']: 
         num_microbatches = inputs.shape[0]
         num_stages = MESH.shape['p']
 
