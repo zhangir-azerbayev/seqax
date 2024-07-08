@@ -22,7 +22,7 @@ MESH = Mesh(mesh_utils.create_device_mesh([4], jax.devices()), ('p'))
 @dataclass 
 class ModelArgs:
     batch: int = 2
-    num_microbatches: int = 8
+    num_microbatches: int = 16
     num_layers: int = 4 # check this works with size of 'p' axis
     d_model: int = 8
     hidden: int = field(init=False)
