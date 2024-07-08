@@ -2,7 +2,7 @@
 import copy
 from dataclasses import dataclass, field
 
-from shardlib.shardtypes import f32, make_shardings, pytree_dataclass, typed_shard_map
+from shardlib.shardtypes import f32, make_shardings, pytree_dataclass, typed_shard_map, typechecked
 from shardlib import shardtypes
 shardtypes.register_with_typeguard()
 import shardlib.shardops as shardops
@@ -51,6 +51,7 @@ class ModelArgs:
 
 with MESH:
     @jax.jit
+    @typechecked
     def rms_norm_forward(x: f32[b'batch seq d_model'], w: RMSNorm) -> f32[b'batch seq d_model']:
         return w.gain * x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + w.eps)
 
@@ -100,6 +101,7 @@ with MESH:
         return out
     
     # we could jit this function, but then the print statements would be less helpful
+    @typechecked
     def transformer_block_forward(
             x: f32[b'batch seq d_model'], 
             w: TransformerBlock
