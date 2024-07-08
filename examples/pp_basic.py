@@ -22,7 +22,7 @@ MESH = Mesh(mesh_utils.create_device_mesh([4], jax.devices()), ('p'))
 @dataclass 
 class ModelArgs:
     batch: int = 2
-    num_microbatches: int = 4
+    num_microbatches: int = 8
     num_layers: int = 4 # check this works with size of 'p' axis
     d_model: int = 8
     hidden: int = field(init=False)
@@ -132,5 +132,8 @@ with MESH:
 
     print("pipeline input:\n", inputs, inputs.sharding)
     print("init carry:\n", init_carries, init_carries.sharding)
-    output = execute_pipeline(init_carries, inputs, weights)
-    print("pipeline output:\n", output, output.sharding)
+    outputs = execute_pipeline(init_carries, inputs, weights)
+    print("pipeline output:\n", outputs, outputs.sharding)
+
+    assert jnp.isclose(2**(cfg.num_layers) * jax.nn.relu(inputs), outputs).all()
+    print("great success!")
