@@ -121,13 +121,13 @@ with MESH:
         eps=jnp.array(1e-5, dtype=jnp.float32)
     )
     w_mha = MultiHeadAttention(
-        qkv=jnp.zeros((cfg.num_heads, cfg.d_model, 3*cfg.head_dim), dtype=jnp.float32),
+        qkv=jnp.ones((cfg.num_heads, cfg.d_model, 3*cfg.head_dim), dtype=jnp.float32),
     )
     w_mha = jax.tree.map(jax.device_put, w_mha, make_shardings(MultiHeadAttention))
     w_norm2 = copy.deepcopy(w_norm1)
     w_mlp = MLP(
-        up=jnp.zeros((cfg.d_model, cfg.hidden), dtype=jnp.float32), 
-        down=jnp.zeros((cfg.hidden, cfg.d_model), dtype=jnp.float32)
+        up=jnp.ones((cfg.d_model, cfg.hidden), dtype=jnp.float32), 
+        down=jnp.ones((cfg.hidden, cfg.d_model), dtype=jnp.float32)
     )
     w_mlp = jax.tree.map(jax.device_put, w_mlp, make_shardings(MLP))
     w = TransformerBlock(
@@ -137,7 +137,8 @@ with MESH:
         mlp=w_mlp,
     )
 
-    y = transformer_block_forward(jnp.zeros((cfg.batch, cfg.seq, cfg.d_model), dtype=jnp.float32), w)
+    key = jax.random.key(42)
+    y = transformer_block_forward(jax.random.normal(key, (cfg.batch, cfg.seq, cfg.d_model), dtype=jnp.float32), w)
 
     assert (y.shape==(cfg.batch, cfg.seq, cfg.d_model))
     print("great success!")
