@@ -62,62 +62,75 @@ with MESH:
     @typed_shard_map
     def pipeline_step(
         carries: f32[b'num_layers/p batch d_model'],
+        input: f32[b'batch d_model'], # trusting compiler to not actually replicate this
         weights: MLPBlocks,
     ) -> Tuple[f32[b'num_layers/p batch d_model'], f32[b'num_layers/p batch d_model']]:
         num_stages = jax.lax.psum(1, 'p')
+        stage_index = jax.lax.axis_index('p')
+
+        carries = jnp.where(
+            stage_index==0,
+            jnp.expand_dims(input, axis=0),
+            carries
+        )
 
         pp_block = jax.vmap(ffn_block, (0, 0), 0)
 
         outputs = pp_block(carries, weights)
 
+        # trusting compiler to not do this on last step of scan
         perm = [(i, (i+1)%num_stages) for i in range(num_stages)]
         new_carries = jax.lax.ppermute(outputs, 'p', perm=perm)
 
         return new_carries, outputs
 
-    # @jax.jit
+    @jax.jit
     def execute_pipeline(
-        pipeline_input: f32[b'num_layers/p batch d_model'],
+        init_carries: f32['num_layers/p batch d_model'],
+        inputs: f32[b'num_microbatches batch d_model'],
         weights: MLPBlocks,
-        num_microbatches: int,
-    ) -> f32['num_layers/p batch d_model']: 
-        num_stages = pipeline_input.shape[0]
+    ) -> f32['num_microbatches batch d_model']: 
+        num_microbatches = inputs.shape[0]
+        num_stages = MESH.shape['p']
+
+        padded_input = jnp.concatenate(
+            (
+                inputs, 
+                jnp.zeros((num_stages-1, inputs.shape[1], inputs.shape[2])),
+            ),
+            axis=0,
+        )
         
-        scan_fn = lambda carries, _: pipeline_step(carries, weights)
+        scan_fn = lambda carries, input: pipeline_step(carries, input, weights)
         
-        _, outputs = jax.lax.scan(scan_fn, pipeline_input, None, length=num_stages+num_microbatches-1)
+        _, outputs = jax.lax.scan(scan_fn, init_carries, padded_input)
         # print("carry after pipeline:\n", _, _.sharding)
 
-        last_stage_outputs = outputs[-num_microbatches:]
+        last_stage_outputs = outputs[-num_microbatches:, -1]
 
         return last_stage_outputs
 
 
     cfg = ModelArgs()
-    num_stages = len(jax.devices())
+    num_stages = MESH.shape['p']
     key = jax.random.key(42)
+    
+    assert cfg.num_layers==num_stages # this code assumes one layer per device
 
-    input = jax.random.normal(key, (cfg.num_microbatches, cfg.batch, cfg.d_model))
-    init_carry = jnp.roll(jnp.concatenate(
-        (
-            jnp.zeros((int(num_stages)-cfg.num_microbatches, cfg.batch, cfg.d_model)), 
-            jnp.flip(input, axis=0), 
-        ),
-        axis=0
-    ), 1, axis=0)
-
-    init_carry = jax.device_put(init_carry, make_shardings(f32['num_layers/p batch d_model']))
+    inputs = jax.random.normal(key, (cfg.num_microbatches, cfg.batch, cfg.d_model))
+    init_carries = jax.device_put(
+        jnp.zeros((cfg.num_layers, cfg.batch, cfg.d_model)),
+        make_shardings(f32['num_layers/p batch d_model'])
+    )
 
     weights = MLPBlocks(
-        up=jnp.stack([jnp.eye(cfg.d_model, cfg.hidden) for _ in range(num_stages)]),
+        up=2 * jnp.stack([jnp.eye(cfg.d_model, cfg.hidden) for _ in range(num_stages)]),
         down=jnp.stack([jnp.eye(cfg.hidden, cfg.d_model) for _ in range(num_stages)]),
     )
     weights = jax.tree.map(jax.device_put, weights, make_shardings(MLPBlocks)) 
 
 
-    print("pipeline input:\n", input, input.sharding)
-    print("init carry:\n", init_carry, init_carry.sharding)
-    output = execute_pipeline(init_carry, weights, num_microbatches=cfg.num_microbatches)
-    output = output[:, -1]
+    print("pipeline input:\n", inputs, inputs.sharding)
+    print("init carry:\n", init_carries, init_carries.sharding)
+    output = execute_pipeline(init_carries, inputs, weights)
     print("pipeline output:\n", output, output.sharding)
-    print("note, batches got reordered, can be easily fixed")
