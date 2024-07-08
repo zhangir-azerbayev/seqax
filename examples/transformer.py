@@ -26,7 +26,7 @@ class MLP:
 
 @pytree_dataclass 
 class RMSNorm:
-    gain: f32['']
+    gain: f32['d_model']
     eps: f32['']
 
 @pytree_dataclass
@@ -117,7 +117,7 @@ with MESH:
     # init dummy weights and do forward pass
     cfg = ModelArgs()
     w_norm1 = RMSNorm(
-        gain=jnp.array(1, dtype=jnp.float32), 
+        gain=jnp.ones((cfg.d_model), dtype=jnp.float32), 
         eps=jnp.array(1e-5, dtype=jnp.float32)
     )
     w_mha = MultiHeadAttention(
