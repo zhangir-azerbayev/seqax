@@ -129,6 +129,7 @@ with MESH:
         y, _ = jax.lax.scan(scan_fn, x, w)
         return y
 
+    @jax.jit
     @typed_shard_map
     def pipeline_step(
         carries: f32[b'num_stages/p batch/d seq d_model/t'], 
