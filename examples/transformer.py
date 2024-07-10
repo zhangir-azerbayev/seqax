@@ -1,4 +1,4 @@
-# XLA_FLAGS=--xla_force_host_platform_device_count=8 python -m examples.transformer
+# XLA_FLAGS=--xla_force_host_platform_device_count=24 python -m examples.transformer
 import copy
 from dataclasses import dataclass, field
 
@@ -11,15 +11,16 @@ from jax.experimental import mesh_utils
 import jax
 import jax.numpy as jnp
 import einops
-from typing import Any
+from typing import Any, Tuple
 
 # `d` is data parallel axis, `t` is tensor parallel axis
-MESH = Mesh(mesh_utils.create_device_mesh([4, 2], jax.devices()), ('d', 't'))
+MESH = Mesh(mesh_utils.create_device_mesh([3, 4, 2], jax.devices()), ('p', 'd', 't'))
 
 @dataclass
 class ModelArgs:
+    num_microbatches: int = 3
     batch: int = 8
-    layers: int = 4
+    layers: int = 6
     seq: int = 12
     d_model: int = 64
     num_heads: int = 4
@@ -41,14 +42,24 @@ class TransformerBlock:
     mlp_down: f32['hidden d_model/t/d']
 
 @pytree_dataclass 
-class Transformer(TransformerBlock):
-    ln1: f32['layers d_model/d']
-    ln2: f32['layers d_model/d']
+class TransformerStage(TransformerBlock):
+    ln1: f32['layers_per_stage d_model/d']
+    ln2: f32['layers_per_stage d_model/d']
 
-    qkv: f32['layers num_heads/t d_model 3head_dim/d']
+    qkv: f32['layers_per_stage num_heads/t d_model 3head_dim/d']
 
-    mlp_up: f32['layers d_model hidden/t/d']
-    mlp_down: f32['layers hidden d_model/t/d']
+    mlp_up: f32['layers_per_stage d_model hidden/t/d']
+    mlp_down: f32['layers_per_stage hidden d_model/t/d']
+
+@pytree_dataclass 
+class Transformer(TransformerStage):
+    ln1: f32['layers/p d_model/d']
+    ln2: f32['layers/p d_model/d']
+
+    qkv: f32['layers/p num_heads/t d_model 3head_dim/d']
+
+    mlp_up: f32['layers/p d_model hidden/t/d']
+    mlp_down: f32['layers/p hidden d_model/t/d']
     
 
 with MESH:
@@ -112,17 +123,64 @@ with MESH:
 
         return x2
 
-    @typed_shard_map
-    def transformer_forward(x: f32[b'batch/d seq d_model/t'], w: Transformer) -> f32[b'batch/d seq d_model/t']:
+    @typechecked
+    def transformer_stage_forward(x: f32[b'batch/d seq d_model/t'], w: TransformerStage) -> f32[b'batch/d seq d_model/t']:
         scan_fn = lambda c, a: (transformer_block_forward(c, a), ())
         y, _ = jax.lax.scan(scan_fn, x, w)
         return y
 
+    @typed_shard_map
+    def pipeline_step(
+        carries: f32[b'num_stages/p batch/d seq d_model/t'], 
+        input: f32[b'batch/d seq d_model/t'], # trust XLA to only materialize this on device 0
+        w: Transformer
+    ) -> Tuple[f32[b'num_stages/p batch/d seq d_model/t'], f32[b'num_stages/p batch/d seq d_model/t']]:
+        num_stages = jax.lax.psum(1, 'p')
+        stage_index = jax.lax.axis_index('p')
+
+        carries = jnp.where(
+            stage_index==0,
+            jnp.expand_dims(input, axis=0),
+            carries
+        )
+        
+        pp_stage = jax.vmap(transformer_stage_forward, (0, None), 0)
+
+        stage_outputs = pp_stage(carries, w)
+
+        # trust XLA to not do the ppermute in last pipeline stage
+        perm = [(i, (i+1)%num_stages) for i in range(num_stages)]
+        new_carries = jax.lax.ppermute(stage_outputs, 'p', perm=perm)
+
+        return new_carries, stage_outputs
+
+    @typechecked
+    def transformer_forward(
+        x: f32[b'num_microbatches batch/d seq d_model/t'],
+        w: Transformer
+    ) -> f32[b'num_microbatches batch/d seq d_model/t']: 
+        num_microbatches = x.shape[0]
+        num_stages = MESH.shape['p']
+
+        init_carries = jnp.zeros((num_stages, *x.shape[1:]))
+        padded_x = jnp.concatenate(
+            (x, jnp.zeros((num_stages-1, *x.shape[1:]))),
+            axis=0
+        )
+
+        scan_fn = lambda carries, input: pipeline_step(carries, input, w)
+
+        _, padded_outputs = jax.lax.scan(scan_fn, init_carries, padded_x)
+
+        outputs = padded_outputs[-num_microbatches:, -1]
+
+        return outputs
+
     cfg = ModelArgs()
 
     key = jax.random.key(42)
-    x = jax.random.normal(key, (cfg.batch, cfg.seq, cfg.d_model))
-    x = jax.device_put(x, make_shardings(f32['batch/d seq d_model/t']))
+    x = jax.random.normal(key, (cfg.num_microbatches, cfg.batch, cfg.seq, cfg.d_model))
+    x = jax.device_put(x, make_shardings(f32['num_microbatches batch/d seq d_model/t']))
 
     w = Transformer(
         ln1=jnp.ones((cfg.layers, cfg.d_model)),
