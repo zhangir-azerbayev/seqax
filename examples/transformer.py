@@ -58,7 +58,7 @@ with MESH:
         return  x * jax.lax.rsqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + 1e-5)
 
 
-    @typed_shard_map
+    @typechecked
     def transformer_block_forward(x: f32[b'batch/d seq d_model/t'], w: TransformerBlock) -> f32[b'batch/d seq d_model/t']:
         # first RMSnorm
         w_ln1 = shardops.all_gather('d_model/d -> d_model', w.ln1)
@@ -112,9 +112,9 @@ with MESH:
 
         return x2
 
-    @typechecked
+    @typed_shard_map
     def transformer_forward(x: f32[b'batch/d seq d_model/t'], w: Transformer) -> f32[b'batch/d seq d_model/t']:
-        scan_fn = lambda c, a: transformer_block_forward(c, a), ()
+        scan_fn = lambda c, a: (transformer_block_forward(c, a), ())
         y, _ = jax.lax.scan(scan_fn, x, w)
         return y
 
@@ -131,16 +131,17 @@ with MESH:
         mlp_up=jnp.zeros((cfg.layers, cfg.d_model, cfg.hidden)),
         mlp_down=jnp.zeros((cfg.layers, cfg.hidden, cfg.d_model))
     )
-    block_w = TransformerBlock(
-        ln1=jnp.ones((cfg.d_model)),
-        ln2=jnp.ones((cfg.d_model)),
-        qkv=jnp.zeros((cfg.num_heads, cfg.d_model, 3*cfg.head_dim)),
-        mlp_up=jnp.zeros((cfg.d_model, cfg.hidden)),
-        mlp_down=jnp.zeros((cfg.hidden, cfg.d_model))
-    )
+    w = jax.tree.map(jax.device_put, w, make_shardings(Transformer))
 
-    block_w = jax.tree.map(jax.device_put, block_w, make_shardings(TransformerBlock))
+    # block_w = TransformerBlock(
+    #     ln1=jnp.ones((cfg.d_model)),
+    #     ln2=jnp.ones((cfg.d_model)),
+    #     qkv=jnp.zeros((cfg.num_heads, cfg.d_model, 3*cfg.head_dim)),
+    #     mlp_up=jnp.zeros((cfg.d_model, cfg.hidden)),
+    #     mlp_down=jnp.zeros((cfg.hidden, cfg.d_model))
+    # )
+    # block_w = jax.tree.map(jax.device_put, block_w, make_shardings(TransformerBlock))
 
     print("###x:", x.shape, x.sharding)
-    y = transformer_block_forward(x, block_w)
+    y = transformer_forward(x, w)
     print("###y: ", y.shape, y.sharding)
