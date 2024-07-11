@@ -163,7 +163,10 @@ with MESH:
         num_microbatches = x.shape[0]
         num_stages = MESH.shape['p']
 
-        init_carries = jnp.zeros((num_stages, *x.shape[1:]))
+        init_carries = jnp.zeros(
+            (num_stages, *x.shape[1:]),
+            device=make_shardings(f32['num_stages/p batch/d seq d_model/t'])
+        )
         padded_x = jnp.concatenate(
             (x, jnp.zeros((num_stages-1, *x.shape[1:]))),
             axis=0
