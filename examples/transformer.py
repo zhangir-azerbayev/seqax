@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import einops
 from typing import Tuple
 
-# `d` is data parallel axis, `t` is tensor parallel axis
+# `p` is pipeline parallel, `d` is data parallel axis, `t` is tensor parallel axis
 MESH = Mesh(mesh_utils.create_device_mesh([3, 4, 2], jax.devices()), ('p', 'd', 't'))
 
 @dataclass
