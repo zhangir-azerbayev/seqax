@@ -1,7 +1,7 @@
 # XLA_FLAGS=--xla_force_host_platform_device_count=32 python -m examples.transformer
 from dataclasses import dataclass, field
 
-from shardlib.shardtypes import f32, make_shardings, pytree_dataclass, typed_shard_map, typechecked
+from shardlib.shardtypes import f32, make_shardings, pytree_dataclass, typed_shard_map, typechecked, Array
 from shardlib import shardtypes
 shardtypes.register_with_typeguard()
 import shardlib.shardops as shardops
@@ -31,7 +31,7 @@ class ModelArgs:
         self.head_dim = self.d_model // self.num_heads
 
 @pytree_dataclass 
-class TransformerBlock:
+class TransformerLayer:
     ln1: f32['d_model/d']
     ln2: f32['d_model/d']
 
@@ -40,25 +40,9 @@ class TransformerBlock:
     mlp_up: f32['d_model hidden/t/d']
     mlp_down: f32['hidden d_model/t/d']
 
-@pytree_dataclass 
-class TransformerStage(TransformerBlock):
-    ln1: f32['layers_per_stage d_model/d']
-    ln2: f32['layers_per_stage d_model/d']
-
-    qkv: f32['layers_per_stage num_heads/t d_model 3head_dim/d']
-
-    mlp_up: f32['layers_per_stage d_model hidden/t/d']
-    mlp_down: f32['layers_per_stage hidden d_model/t/d']
-
-@pytree_dataclass 
-class Transformer(TransformerStage):
-    ln1: f32['layers/p d_model/d']
-    ln2: f32['layers/p d_model/d']
-
-    qkv: f32['layers/p num_heads/t d_model 3head_dim/d']
-
-    mlp_up: f32['layers/p d_model hidden/t/d']
-    mlp_down: f32['layers/p hidden d_model/t/d']
+TransformerStage = Array['layers_per_stage', TransformerLayer]
+Transformer = Array['layers/p', TransformerLayer]
+Transformer.__bases__ = (TransformerStage,)
     
 
 with MESH:
@@ -69,7 +53,7 @@ with MESH:
 
 
     @typechecked
-    def transformer_block_forward(x: f32[b'batch/d seq d_model/t'], w: TransformerBlock) -> f32[b'batch/d seq d_model/t']:
+    def transformer_block_forward(x: f32[b'batch/d seq d_model/t'], w: TransformerLayer) -> f32[b'batch/d seq d_model/t']:
         # first RMSnorm
         w_ln1 = shardops.all_gather('d_model/d -> d_model', w.ln1)
         gx = shardops.all_gather('batch/d seq d_model/t -> batch/d seq d_model', x)
