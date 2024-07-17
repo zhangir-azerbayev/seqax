@@ -1,4 +1,4 @@
-# XLA_FLAGS=--xla_force_host_platform_device_count=24 python -m examples.transformer
+# XLA_FLAGS=--xla_force_host_platform_device_count=32 python -m examples.transformer
 import copy
 from dataclasses import dataclass, field
 
@@ -14,13 +14,13 @@ import einops
 from typing import Any, Tuple
 
 # `d` is data parallel axis, `t` is tensor parallel axis
-MESH = Mesh(mesh_utils.create_device_mesh([3, 4, 2], jax.devices()), ('p', 'd', 't'))
+MESH = Mesh(mesh_utils.create_device_mesh([4, 4, 2], jax.devices()), ('p', 'd', 't'))
 
 @dataclass
 class ModelArgs:
-    num_microbatches: int = 3
+    num_microbatches: int = 4
     batch: int = 8
-    layers: int = 6
+    layers: int = 8
     seq: int = 12
     d_model: int = 64
     num_heads: int = 4
@@ -194,15 +194,6 @@ with MESH:
         mlp_down=jnp.zeros((cfg.layers, cfg.hidden, cfg.d_model))
     )
     w = jax.tree.map(jax.device_put, w, make_shardings(Transformer))
-
-    # block_w = TransformerBlock(
-    #     ln1=jnp.ones((cfg.d_model)),
-    #     ln2=jnp.ones((cfg.d_model)),
-    #     qkv=jnp.zeros((cfg.num_heads, cfg.d_model, 3*cfg.head_dim)),
-    #     mlp_up=jnp.zeros((cfg.d_model, cfg.hidden)),
-    #     mlp_down=jnp.zeros((cfg.hidden, cfg.d_model))
-    # )
-    # block_w = jax.tree.map(jax.device_put, block_w, make_shardings(TransformerBlock))
 
     print("###x:", x.shape, x.sharding)
     y = transformer_forward(x, w)
