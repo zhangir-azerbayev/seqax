@@ -1,26 +1,25 @@
 # XLA_FLAGS=--xla_force_host_platform_device_count=32 python -m examples.transformer
-import copy
 from dataclasses import dataclass, field
 
 from shardlib.shardtypes import f32, make_shardings, pytree_dataclass, typed_shard_map, typechecked
 from shardlib import shardtypes
 shardtypes.register_with_typeguard()
 import shardlib.shardops as shardops
-from jax.sharding import Mesh, PartitionSpec as P
+from jax.sharding import Mesh
 from jax.experimental import mesh_utils
 import jax
 import jax.numpy as jnp
 import einops
-from typing import Any, Tuple
+from typing import Tuple
 
 # `d` is data parallel axis, `t` is tensor parallel axis
-MESH = Mesh(mesh_utils.create_device_mesh([4, 4, 2], jax.devices()), ('p', 'd', 't'))
+MESH = Mesh(mesh_utils.create_device_mesh([3, 4, 2], jax.devices()), ('p', 'd', 't'))
 
 @dataclass
 class ModelArgs:
     num_microbatches: int = 4
     batch: int = 8
-    layers: int = 8
+    layers: int = 6
     seq: int = 12
     d_model: int = 64
     num_heads: int = 4
@@ -129,21 +128,16 @@ with MESH:
         y, _ = jax.lax.scan(scan_fn, x, w)
         return y
 
-    @jax.jit
-    @typed_shard_map
+    @typechecked
     def pipeline_step(
         carries: f32[b'num_stages/p batch/d seq d_model/t'], 
-        input: f32[b'batch/d seq d_model/t'], # trust XLA to only materialize this on device 0
+        input: f32[b'num_stages/p batch/d seq d_model/t'], # trust XLA to only materialize this on device 0
         w: Transformer
     ) -> Tuple[f32[b'num_stages/p batch/d seq d_model/t'], f32[b'num_stages/p batch/d seq d_model/t']]:
         num_stages = jax.lax.psum(1, 'p')
         stage_index = jax.lax.axis_index('p')
 
-        carries = jnp.where(
-            stage_index==0,
-            jnp.expand_dims(input, axis=0),
-            carries
-        )
+        carries = jnp.where(stage_index==0, input, carries)
         
         pp_stage = jax.vmap(transformer_stage_forward, (0, None), 0)
 
@@ -155,16 +149,18 @@ with MESH:
 
         return new_carries, stage_outputs
 
-    @typechecked
+    @jax.jit
+    @typed_shard_map
     def transformer_forward(
-        x: f32[b'num_microbatches batch/d seq d_model/t'],
+        x: f32[b'num_microbatches num_stages/p batch/d seq d_model/t'],
         w: Transformer
-    ) -> f32[b'num_microbatches batch/d seq d_model/t']: 
+    ) -> f32[b'num_microbatches num_stages/p batch/d seq d_model/t']: 
         num_microbatches = x.shape[0]
-        num_stages = MESH.shape['p']
+        num_stages = jax.lax.psum(1, 'p')
+        stage_index = jax.lax.axis_index('p')
 
         init_carries = jnp.zeros(
-            (num_stages, *x.shape[1:]),
+            x.shape[1:],
             device=make_shardings(f32['num_stages/p batch/d seq d_model/t'])
         )
         padded_x = jnp.concatenate(
@@ -176,15 +172,18 @@ with MESH:
 
         _, padded_outputs = jax.lax.scan(scan_fn, init_carries, padded_x)
 
-        outputs = padded_outputs[-num_microbatches:, -1]
+        outputs = padded_outputs[-num_microbatches:]
+        outputs = jnp.where(stage_index==num_stages-1, outputs, 0)
 
         return outputs
 
     cfg = ModelArgs()
+    num_stages = MESH.shape['p']
 
     key = jax.random.key(42)
-    x = jax.random.normal(key, (cfg.num_microbatches, cfg.batch, cfg.seq, cfg.d_model))
-    x = jax.device_put(x, make_shardings(f32['num_microbatches batch/d seq d_model/t']))
+    x = jax.random.normal(key, (cfg.num_microbatches, num_stages, cfg.batch, cfg.seq, cfg.d_model))
+    x = x.at[:, 1:].set(0)
+    x = jax.device_put(x, make_shardings(f32['num_microbatches num_stages/p batch/d seq d_model/t']))
 
     w = Transformer(
         ln1=jnp.ones((cfg.layers, cfg.d_model)),
@@ -198,3 +197,4 @@ with MESH:
     print("###x:", x.shape, x.sharding)
     y = transformer_forward(x, w)
     print("###y: ", y.shape, y.sharding)
+    assert jnp.isclose(y[:, :-1], 0).all()
