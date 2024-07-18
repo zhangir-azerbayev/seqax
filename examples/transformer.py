@@ -1,4 +1,4 @@
-# XLA_FLAGS=--xla_force_host_platform_device_count=32 python -m examples.transformer
+# XLA_FLAGS=--xla_force_host_platform_device_count=24 python -m examples.transformer
 from dataclasses import dataclass, field
 
 from shardlib.shardtypes import f32, make_shardings, pytree_dataclass, typed_shard_map, typechecked, Array
@@ -54,6 +54,8 @@ with MESH:
 
     @typechecked
     def transformer_block_forward(x: f32[b'batch/d seq d_model/t'], w: TransformerLayer) -> f32[b'batch/d seq d_model/t']:
+        causal_mask = jnp.tril(jnp.full((x.shape[1], x.shape[1]), True))
+
         # first RMSnorm
         w_ln1 = shardops.all_gather('d_model/d -> d_model', w.ln1)
         gx = shardops.all_gather('batch/d seq d_model/t -> batch/d seq d_model', x)
@@ -70,7 +72,7 @@ with MESH:
             'batch/d num_heads/t seq head_dim, batch/d num_heads/t seq_ head_dim -> batch/d num_heads/t seq seq_',
             Q, K
         )
-        attn_scores = jax.nn.softmax(jnp.tril(logits))
+        attn_scores = jax.nn.softmax(jnp.where(causal_mask, logits, -1e10))
 
         unflattened_attn_out = shardops.einsum_unreduced(
             'batch/d num_heads/t seq seq_, batch/d num_heads/t seq_ head_dim -> batch/d num_heads/t seq head_dim',
