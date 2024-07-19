@@ -78,7 +78,12 @@ with MESH:
             'batch/d num_heads/t seq seq_, batch/d num_heads/t seq_ head_dim -> batch/d num_heads/t seq head_dim',
             attn_scores, V
         )
+        unflattened_attn_out = shardops.all_gather(
+            'batch/d num_heads/t seq head_dim -> batch/d num_heads seq head_dim',
+            unflattened_attn_out
+        )
         attn_out = einops.rearrange(unflattened_attn_out, 'b nh s hd -> b s (nh hd)')
+        attn_out = shardops.psum_scatter('batch/d seq d_model -> batch/d seq d_model/t', attn_out)
 
         # residual connection
         x1 = x + attn_out
