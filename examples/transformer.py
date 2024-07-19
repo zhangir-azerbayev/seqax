@@ -135,7 +135,7 @@ with MESH:
 
         return new_carries, stage_outputs
 
-    # @jax.jit
+    @jax.jit
     @typed_shard_map
     def transformer_forward(
         x: f32[b'num_microbatches num_stages/p batch/d seq d_model/t'],
