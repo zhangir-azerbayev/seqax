@@ -38,7 +38,7 @@ class TransformerLayer:
     qkv: f32['num_heads/t d_model 3head_dim/d']
 
     mlp_up: f32['d_model hidden/t/d']
-    mlp_down: f32['hidden d_model/t/d']
+    mlp_down: f32['hidden/t d_model/d']
 
 TransformerStage = Array['layers_per_stage', TransformerLayer]
 Transformer = Array['layers/p', TransformerLayer]
@@ -101,12 +101,12 @@ with MESH:
         )
         hidden_act = jax.nn.relu(hidden_preact)
 
-        hidden_act = shardops.all_gather('batch/d seq hidden/t -> batch/d seq hidden', hidden_act)
-        w_down = shardops.all_gather('hidden d_model/t/d -> hidden d_model/t', w.mlp_down)
+        w_down = shardops.all_gather('hidden/t d_model/d -> hidden/t d_model', w.mlp_down)
         mlp_out = shardops.einsum_unreduced(
-            'batch/d seq hidden, hidden d_model/t -> batch/d seq d_model/t', 
+            'batch/d seq hidden/t, hidden/t d_model -> batch/d seq d_model', 
             hidden_act, w_down
         )
+        mlp_out = shardops.psum_scatter('batch/d seq d_model -> batch/d seq d_model/t', mlp_out)
 
         # residual connection
         x2 = x1 + mlp_out
@@ -140,7 +140,7 @@ with MESH:
 
         return new_carries, stage_outputs
 
-    @jax.jit
+    # @jax.jit
     @typed_shard_map
     def transformer_forward(
         x: f32[b'num_microbatches num_stages/p batch/d seq d_model/t'],
