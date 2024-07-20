@@ -35,7 +35,7 @@ class TransformerLayer:
     ln1: f32['d_model/d']
     ln2: f32['d_model/d']
 
-    qkv: f32['num_heads/t d_model 3head_dim/d']
+    qkv: f32['3 num_heads/t d_model head_dim/d']
 
     mlp_up: f32['d_model hidden/t/d']
     mlp_down: f32['hidden/t d_model/d']
@@ -62,12 +62,11 @@ with MESH:
         normed_x = w_ln1 * rms_norm(gx)
 
         # attention layer
-        w_qkv = shardops.all_gather('num_heads/t d_model 3head_dim/d -> num_heads/t d_model 3head_dim', w.qkv)
-        QKV = shardops.einsum_unreduced(
-            'batch/d seq d_model, num_heads/t d_model 3head_dim -> batch/d num_heads/t seq 3head_dim', 
+        w_qkv = shardops.all_gather('3 num_heads/t d_model head_dim/d -> 3 num_heads/t d_model head_dim', w.qkv)
+        Q, K, V = shardops.einsum_unreduced(
+            'batch/d seq d_model, 3 num_heads/t d_model head_dim -> 3 batch/d num_heads/t seq head_dim', 
             normed_x, w_qkv
         )
-        Q, K, V = jnp.split(QKV, 3, axis=-1)
         logits = shardops.einsum_unreduced(
             'batch/d num_heads/t seq head_dim, batch/d num_heads/t seq_ head_dim -> batch/d num_heads/t seq seq_',
             Q, K
@@ -174,7 +173,7 @@ with MESH:
     w = Transformer(
         ln1=jnp.ones((cfg.layers, cfg.d_model)),
         ln2=jnp.ones((cfg.layers, cfg.d_model)),
-        qkv=jnp.zeros((cfg.layers, cfg.num_heads, cfg.d_model, 3*cfg.head_dim)),
+        qkv=jnp.zeros((cfg.layers, 3, cfg.num_heads, cfg.d_model, cfg.head_dim)),
         mlp_up=jnp.zeros((cfg.layers, cfg.d_model, cfg.hidden)),
         mlp_down=jnp.zeros((cfg.layers, cfg.hidden, cfg.d_model))
     )
